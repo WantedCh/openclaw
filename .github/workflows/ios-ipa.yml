@@ -2,6 +2,17 @@ name: iOS IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      export_method:
+        description: "IPA export method (development, ad-hoc, app-store, enterprise)"
+        required: false
+        default: ad-hoc
+        type: choice
+        options:
+          - development
+          - ad-hoc
+          - app-store
+          - enterprise
   push:
     branches:
       - main
@@ -77,3 +88,152 @@ jobs:
           name: openclaw-ios-unsigned-ipa
           path: ${{ runner.temp }}/OpenClaw-unsigned.ipa
           if-no-files-found: error
+
+  build-signed-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+    env:
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+      IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+      IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+      IOS_PROFILE_APP_BASE64: ${{ secrets.IOS_PROFILE_APP_BASE64 }}
+      IOS_PROFILE_SHARE_BASE64: ${{ secrets.IOS_PROFILE_SHARE_BASE64 }}
+      IOS_APP_BUNDLE_ID: ${{ secrets.IOS_APP_BUNDLE_ID }}
+      IOS_SHARE_BUNDLE_ID: ${{ secrets.IOS_SHARE_BUNDLE_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+          for key in IOS_TEAM_ID IOS_CERT_P12_BASE64 IOS_CERT_PASSWORD IOS_PROFILE_APP_BASE64 IOS_PROFILE_SHARE_BASE64; do
+            if [[ -z "${!key:-}" ]]; then
+              echo "Missing required secret: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Setup tools
+        run: |
+          set -euo pipefail
+          brew install xcodegen swiftlint swiftformat
+          xcodebuild -version
+          swift --version
+
+      - name: Generate iOS project
+        run: |
+          set -euo pipefail
+          cd apps/ios
+          xcodegen generate
+
+      - name: Install signing certificate and profiles
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          CERT_PATH="$RUNNER_TEMP/signing-cert.p12"
+          PROFILE_APP_PATH="$RUNNER_TEMP/openclaw-app.mobileprovision"
+          PROFILE_SHARE_PATH="$RUNNER_TEMP/openclaw-share.mobileprovision"
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+
+          echo "$IOS_CERT_P12_BASE64" | base64 -D > "$CERT_PATH"
+          echo "$IOS_PROFILE_APP_BASE64" | base64 -D > "$PROFILE_APP_PATH"
+          echo "$IOS_PROFILE_SHARE_BASE64" | base64 -D > "$PROFILE_SHARE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$IOS_CERT_PASSWORD" -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          mkdir -p "$PROFILE_DIR"
+          cp "$PROFILE_APP_PATH" "$PROFILE_DIR/openclaw-app.mobileprovision"
+          cp "$PROFILE_SHARE_PATH" "$PROFILE_DIR/openclaw-share.mobileprovision"
+
+          APP_PROFILE_NAME="$(security cms -D -i "$PROFILE_APP_PATH" | plutil -extract Name raw -o - -)"
+          SHARE_PROFILE_NAME="$(security cms -D -i "$PROFILE_SHARE_PATH" | plutil -extract Name raw -o - -)"
+          APP_BUNDLE_ID="${IOS_APP_BUNDLE_ID:-ai.openclaw.ios}"
+          SHARE_BUNDLE_ID="${IOS_SHARE_BUNDLE_ID:-ai.openclaw.ios.share}"
+
+          {
+            echo "KEYCHAIN_PATH=$KEYCHAIN_PATH"
+            echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
+            echo "APP_PROFILE_NAME=$APP_PROFILE_NAME"
+            echo "SHARE_PROFILE_NAME=$SHARE_PROFILE_NAME"
+            echo "APP_BUNDLE_ID=$APP_BUNDLE_ID"
+            echo "SHARE_BUNDLE_ID=$SHARE_BUNDLE_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Archive app
+        run: |
+          set -euo pipefail
+          ARCHIVE_PATH="$RUNNER_TEMP/OpenClaw.xcarchive"
+
+          xcodebuild \
+            -project apps/ios/OpenClaw.xcodeproj \
+            -scheme OpenClaw \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$ARCHIVE_PATH" \
+            OPENCLAW_CODE_SIGN_STYLE=Manual \
+            OPENCLAW_DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+            OPENCLAW_APP_PROFILE="$APP_PROFILE_NAME" \
+            OPENCLAW_SHARE_PROFILE="$SHARE_PROFILE_NAME" \
+            archive
+
+      - name: Export signed IPA
+        run: |
+          set -euo pipefail
+          ARCHIVE_PATH="$RUNNER_TEMP/OpenClaw.xcarchive"
+          EXPORT_DIR="$RUNNER_TEMP/export"
+          EXPORT_METHOD="${{ github.event.inputs.export_method || 'ad-hoc' }}"
+          EXPORT_OPTIONS_PATH="$RUNNER_TEMP/ExportOptions.plist"
+
+          cat > "$EXPORT_OPTIONS_PATH" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${EXPORT_METHOD}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>${IOS_TEAM_ID}</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${APP_BUNDLE_ID}</key>
+              <string>${APP_PROFILE_NAME}</string>
+              <key>${SHARE_BUNDLE_ID}</key>
+              <string>${SHARE_PROFILE_NAME}</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_DIR" \
+            -exportOptionsPlist "$EXPORT_OPTIONS_PATH"
+
+      - name: Upload signed IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-ios-signed-ipa
+          path: ${{ runner.temp }}/export/*.ipa
+          if-no-files-found: error
+
+      - name: Cleanup signing material
+        if: always()
+        run: |
+          set -euo pipefail
+          security delete-keychain "${KEYCHAIN_PATH:-$RUNNER_TEMP/build.keychain-db}" || true
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/openclaw-app.mobileprovision"
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/openclaw-share.mobileprovision"
