@@ -1,0 +1,79 @@
+name: iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/ios/**"
+      - "apps/shared/**"
+      - "Swabble/**"
+      - ".github/workflows/ios-ipa.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Setup tools
+        run: |
+          set -euo pipefail
+          brew install xcodegen swiftlint swiftformat
+          xcodebuild -version
+          swift --version
+
+      - name: Generate iOS project
+        run: |
+          set -euo pipefail
+          cd apps/ios
+          xcodegen generate
+
+      - name: Build iOS app (unsigned)
+        env:
+          OPENCLAW_DEVELOPMENT_TEAM: Y5PE65HELJ
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project apps/ios/OpenClaw.xcodeproj \
+            -scheme OpenClaw \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            OPENCLAW_CODE_SIGN_STYLE=Automatic \
+            OPENCLAW_DEVELOPMENT_TEAM="$OPENCLAW_DEVELOPMENT_TEAM" \
+            OPENCLAW_APP_PROFILE= \
+            OPENCLAW_SHARE_PROFILE= \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/OpenClaw.app"
+          if [[ ! -d "$APP_PATH" ]]; then
+            echo "Expected app not found: $APP_PATH" >&2
+            exit 1
+          fi
+          PAYLOAD_DIR="$RUNNER_TEMP/Payload"
+          mkdir -p "$PAYLOAD_DIR"
+          cp -R "$APP_PATH" "$PAYLOAD_DIR/OpenClaw.app"
+          cd "$RUNNER_TEMP"
+          /usr/bin/zip -qry OpenClaw-unsigned.ipa Payload
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-ios-unsigned-ipa
+          path: ${{ runner.temp }}/OpenClaw-unsigned.ipa
+          if-no-files-found: error
